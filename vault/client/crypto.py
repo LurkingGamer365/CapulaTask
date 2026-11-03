@@ -44,7 +44,11 @@ def _expand(master_key: bytes, purpose: str) -> bytes:
 
 
 def derive_keys(email: str, master_password: str) -> ClientKeys:
-    """Same inputs always give the same keys. Use argon2.low_level.hash_secret_raw and HKDF."""
+    """Same inputs always give the same keys.
+
+    The password is used as its exact UTF-8 bytes, with no Unicode normalisation, so every client
+    must do the same. tests/test_api.py pins the expected outputs.
+    """
     salt_input = f"{SIGNING_CONTEXT}/salt/{normalise_email(email)}".encode()
     master_key = hash_secret_raw(
         secret=master_password.encode(),

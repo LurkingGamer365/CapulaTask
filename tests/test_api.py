@@ -9,7 +9,8 @@ from fastapi.testclient import TestClient
 
 from vault.client.api import VaultApiError, VaultClient
 from vault.client.crypto import decrypt_vault, derive_keys, encrypt_vault
-from vault.protocol import b64decode, b64encode
+from vault.protocol import b64decode, b64encode, signing_bytes
+from vault.server import app as server_app
 from vault.server.app import create_app
 from vault.server.db import Database, ReplayedNonce
 
@@ -55,6 +56,23 @@ def test_key_derivation_is_deterministic():
     first, second = derive_keys(EMAIL, PASSWORD), derive_keys(" Test@Example.com", PASSWORD)
     assert first.encryption_key == second.encryption_key
     assert first.signing_key.private_bytes_raw() == second.signing_key.private_bytes_raw()
+
+
+def test_key_derivation_matches_fixed_outputs():
+    """Any change to encoding, salt, Argon2id settings or HKDF labels changes every user's keys."""
+    keys = derive_keys(EMAIL, PASSWORD)
+    public_key = keys.signing_key.public_key().public_bytes_raw()
+    assert public_key.hex() == "7a8a5d5348749d72900e5430c8ff2453096d881e8950eef7ed294a1917d889fd"
+    assert keys.encryption_key.hex() == "8e4ee14c59b3a9ce8bd5ca6bbbf97a1d97d5766d55242dfeda365e1ce78c6640"
+
+
+def test_password_is_not_unicode_normalised():
+    composed, decomposed = "päss", "päss"  # both display as "päss"
+    assert derive_keys(EMAIL, composed).encryption_key != derive_keys(EMAIL, decomposed).encryption_key
+
+
+def test_signing_bytes_are_fixed():
+    assert signing_bytes("a@b.c", "cGF5", 1) == b'["vault-backup-v1","a@b.c",1,"cGF5"]'
 
 
 def test_keys_depend_on_password_and_email():
@@ -163,8 +181,42 @@ def test_replayed_request_is_rejected(client):
 
 
 def test_lower_nonce_is_rejected(client):
-    client.send(client.sign_envelope({"type": "store", "vault": ""}, 5))
+    client.send(client.sign_envelope({"type": "store", "vault": b64encode(b"blob")}, 5))
     assert_rejected(client.send(client.sign_envelope({"type": "retrieve"}, 4)), 409, "replayed_nonce")
+
+
+def send_signed_payload(client, payload: bytes):
+    """Sign raw payload bytes, bypassing the client's JSON encoding."""
+    envelope = client.sign_envelope({}, client.last_nonce() + 1)
+    payload_b64 = b64encode(payload)
+    signature = client.keys.signing_key.sign(signing_bytes(client.email, payload_b64, envelope.nonce))
+    return client.send(envelope.model_copy(update={"payload": payload_b64, "signature": b64encode(signature)}))
+
+
+@pytest.mark.parametrize("payload", [b"not json", b"\xff\xfe", b'["store"]'])
+def test_signed_malformed_payload_is_rejected(client, payload):
+    assert_rejected(send_signed_payload(client, payload), 400, "malformed_payload")
+    assert client.last_nonce() == 0
+
+
+@pytest.mark.parametrize("vault", [None, "!!!", 123])
+def test_signed_store_with_invalid_vault_is_rejected(client, vault):
+    response = client.send(client.build_envelope({"type": "store", "vault": vault}))
+    assert_rejected(response, 400, "malformed_payload")
+    assert client.last_nonce() == 0
+
+
+def test_empty_vault_is_rejected_and_keeps_backup(client):
+    client.store(b"blob")
+    assert_rejected(client.send(client.build_envelope({"type": "store", "vault": ""})), 400, "empty_vault")
+    assert client.retrieve() == b"blob"
+
+
+def test_oversized_vault_is_rejected(client, monkeypatch):
+    monkeypatch.setattr(server_app, "MAX_VAULT_BYTES", 16)
+    client.store(b"x" * 16)
+    assert_api_error(lambda: client.store(b"x" * 17), 413, "vault_too_large")
+    assert client.retrieve() == b"x" * 16
 
 
 def test_bad_signature_does_not_consume_nonce(client):

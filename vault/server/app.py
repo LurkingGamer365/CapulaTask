@@ -35,6 +35,9 @@ def _decode_vault(vault: object) -> bytes:
         blob = b64decode(vault)
     except ValueError as error:
         raise ApiError(400, "malformed_payload", "Store requests need a Base64 vault") from error
+    # An empty store would silently erase the backup; deletion should be its own operation.
+    if not blob:
+        raise ApiError(400, "empty_vault", "Vault must not be empty")
     if len(blob) > MAX_VAULT_BYTES:
         raise ApiError(413, "vault_too_large", "Vault exceeds the maximum size")
     return blob
